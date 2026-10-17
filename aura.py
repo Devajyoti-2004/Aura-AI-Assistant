@@ -175,7 +175,7 @@ class AuraApp:
                     except Exception:
                         continue
                     normalized = phrase.lower().replace(",", " ")
-                    match = re.search(r"\\b(?:hey|hi|okay|ok)\\s+aura\\b[, ]*(.*)", normalized)
+                    match = re.search(r"\b(?:hey|hi|okay|ok)\s+aura\b[, ]*(.*)", normalized)
                     if not match:
                         continue
                     command = match.group(1).strip(" .,!?")

@@ -26,6 +26,17 @@ try:
 except Exception:
     sr = None
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
 
 class AuraApp:
     def __init__(self, root: tk.Tk) -> None:
@@ -36,6 +47,11 @@ class AuraApp:
         self.root.configure(bg="#0b1020")
         self.engine = None
         self._speech_lock = threading.Lock()
+        self._ai_lock = threading.Lock()
+        self.ai_history: list[dict[str, str]] = []
+        self.wake_stop = threading.Event()
+        self.wake_thread: threading.Thread | None = None
+        self.wake_active = False
         if pyttsx3:
             try:
                 self.engine = pyttsx3.init()
@@ -80,7 +96,9 @@ class AuraApp:
         entry.pack(side="left", fill="x", expand=True, ipady=12, padx=(0, 8))
         entry.bind("<Return>", lambda _event: self.submit())
         ttk.Button(bottom, text="Run command", command=self.submit).pack(side="left", padx=(0, 8))
-        ttk.Button(bottom, text="🎙 Speak", command=self.listen).pack(side="left")
+        ttk.Button(bottom, text="🎙 Speak", command=self.listen).pack(side="left", padx=(0, 8))
+        self.wake_button = ttk.Button(bottom, text="Start Wake Word", command=self.toggle_wake_word)
+        self.wake_button.pack(side="left")
         entry.focus_set()
 
     def log(self, message: str, speaker: str = "Aura") -> None:
@@ -121,6 +139,65 @@ class AuraApp:
                                 "Install SpeechRecognition and a compatible PyAudio build, then restart Aura. You can still type commands.")
             return
         threading.Thread(target=self._listen_worker, daemon=True).start()
+
+    def toggle_wake_word(self) -> None:
+        if not sr:
+            messagebox.showinfo(
+                "Voice input unavailable",
+                "Install SpeechRecognition and a compatible PyAudio build before enabling the wake word."
+            )
+            return
+        if self.wake_active:
+            self.wake_stop.set()
+            self.wake_active = False
+            self.wake_button.configure(text="Start Wake Word")
+            self.say("Wake-word listening is stopping.")
+            return
+        self.wake_stop.clear()
+        self.wake_active = True
+        self.wake_button.configure(text="Stop Wake Word")
+        self.say("Wake-word listening is on. Say 'Hey Aura' to activate me.")
+        self.wake_thread = threading.Thread(target=self._wake_word_worker, daemon=True)
+        self.wake_thread.start()
+
+    def _wake_word_worker(self) -> None:
+        recognizer = sr.Recognizer()
+        try:
+            with sr.Microphone() as source:
+                recognizer.adjust_for_ambient_noise(source, duration=0.4)
+                while not self.wake_stop.is_set():
+                    try:
+                        audio = recognizer.listen(source, timeout=1, phrase_time_limit=5)
+                    except sr.WaitTimeoutError:
+                        continue
+                    try:
+                        phrase = recognizer.recognize_google(audio).strip()
+                    except Exception:
+                        continue
+                    normalized = phrase.lower().replace(",", " ")
+                    match = re.search(r"\\b(?:hey|hi|okay|ok)\\s+aura\\b[, ]*(.*)", normalized)
+                    if not match:
+                        continue
+                    command = match.group(1).strip(" .,!?")
+                    self.root.after(0, lambda p=phrase: self.log(p, "Wake word"))
+                    if not command:
+                        self.root.after(0, lambda: self.say("I'm listening. Please say your command."))
+                        try:
+                            follow_up = recognizer.listen(source, timeout=5, phrase_time_limit=8)
+                            command = recognizer.recognize_google(follow_up).strip()
+                        except Exception:
+                            self.root.after(0, lambda: self.log("I didn't catch a command. Try again."))
+                            continue
+                    if command:
+                        self.root.after(0, lambda q=command: self.log(q, "You (voice)"))
+                        self.handle_command(command)
+        except Exception as exc:
+            self.root.after(0, lambda e=str(exc): self.say(
+                f"Wake-word listener stopped: {e}. You can still type commands or use Speak."
+            ))
+        finally:
+            self.wake_active = False
+            self.root.after(0, lambda: self.wake_button.configure(text="Start Wake Word"))
 
     def _listen_worker(self) -> None:
         try:
@@ -229,7 +306,47 @@ class AuraApp:
                 self.say(f"I couldn't find {folder_name} in your home folder.")
             return
 
-        self.say("I don't know that command yet. Say 'help' to see supported commands.")
+        # Natural-language questions fall back to the optional AI conversation engine.
+        if OpenAI and os.environ.get("OPENAI_API_KEY", "").strip():
+            self.ask_ai(cmd)
+        else:
+            self.say(
+                "I don't know that command yet. Say 'help' for system commands. "
+                "For AI conversation, install the requirements and configure OPENAI_API_KEY in a local .env file."
+            )
+
+    def ask_ai(self, prompt: str) -> None:
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if not OpenAI or not api_key:
+            self.say("AI chat is not configured. Add OPENAI_API_KEY to your local .env file.")
+            return
+        model = os.environ.get("OPENAI_MODEL", "gpt-5.5").strip() or "gpt-5.5"
+        try:
+            with self._ai_lock:
+                client = OpenAI(api_key=api_key)
+                history = self.ai_history[-12:]
+                response = client.responses.create(
+                    model=model,
+                    instructions=(
+                        "You are Aura, a helpful, concise desktop assistant. "
+                        "You may explain how to do tasks, but do not claim to have performed "
+                        "actions on the computer unless the application explicitly did so. "
+                        "Never request or reveal passwords, API keys, or other secrets."
+                    ),
+                    input=history + [{"role": "user", "content": prompt}],
+                    max_output_tokens=500,
+                )
+                answer = (response.output_text or "").strip()
+                if not answer:
+                    answer = "I couldn't generate a response just now. Please try again."
+                self.ai_history.extend([
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": answer},
+                ])
+                self.ai_history = self.ai_history[-12:]
+            self.say(answer)
+        except Exception as exc:
+            self.say(f"AI request failed: {exc}. Check your API key, model setting, and internet connection.")
 
     def _confirm_lock_screen(self) -> None:
         if not messagebox.askyesno("Confirm lock", "Lock this computer now?"):
@@ -277,6 +394,7 @@ class AuraApp:
             self.say(f"Could not adjust volume: {exc}")
 
     def on_close(self) -> None:
+        self.wake_stop.set()
         try:
             if self.engine:
                 self.engine.stop()

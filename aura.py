@@ -84,9 +84,13 @@ class AuraApp:
         entry.focus_set()
 
     def log(self, message: str, speaker: str = "Aura") -> None:
+        # Tk widgets must only be touched by the UI thread.
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, lambda m=message, s=speaker: self.log(m, s))
+            return
         stamp = _dt.datetime.now().strftime("%H:%M:%S")
         self.output.configure(state="normal")
-        self.output.insert("end", f"[{stamp}] {speaker}: {message}\n")
+        self.output.insert("end", f"[{stamp}] {speaker}: {message}\\n")
         self.output.see("end")
         self.output.configure(state="disabled")
 
@@ -94,11 +98,13 @@ class AuraApp:
         self.log(message)
         if self.engine:
             def speak() -> None:
-                try:
-                    self.engine.say(message)
-                    self.engine.runAndWait()
-                except Exception:
-                    pass
+                # pyttsx3 engines are not safe for concurrent runAndWait calls.
+                with self._speech_lock:
+                    try:
+                        self.engine.say(message)
+                        self.engine.runAndWait()
+                    except Exception:
+                        pass
             threading.Thread(target=speak, daemon=True).start()
 
     def submit(self) -> None:

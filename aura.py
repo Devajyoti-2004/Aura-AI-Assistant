@@ -35,6 +35,7 @@ class AuraApp:
         self.root.minsize(680, 500)
         self.root.configure(bg="#0b1020")
         self.engine = None
+        self._speech_lock = threading.Lock()
         if pyttsx3:
             try:
                 self.engine = pyttsx3.init()
@@ -202,14 +203,8 @@ class AuraApp:
             if not IS_WINDOWS:
                 self.say("Lock screen is currently implemented for Windows only.")
                 return
-            if messagebox.askyesno("Confirm lock", "Lock this computer now?"):
-                try:
-                    subprocess.Popen(["rundll32.exe", "user32.dll,LockWorkStation"])
-                    self.say("Locking the screen.")
-                except Exception as exc:
-                    self.say(f"Could not lock the screen: {exc}")
-            else:
-                self.say("Cancelled.")
+            # Confirmation dialogs must be created on Tk's UI thread.
+            self.root.after(0, self._confirm_lock_screen)
             return
 
         if low in {"open downloads", "open documents", "open desktop"}:
@@ -229,6 +224,16 @@ class AuraApp:
             return
 
         self.say("I don't know that command yet. Say 'help' to see supported commands.")
+
+    def _confirm_lock_screen(self) -> None:
+        if not messagebox.askyesno("Confirm lock", "Lock this computer now?"):
+            self.say("Cancelled.")
+            return
+        try:
+            subprocess.Popen(["rundll32.exe", "user32.dll,LockWorkStation"])
+            self.say("Locking the screen.")
+        except Exception as exc:
+            self.say(f"Could not lock the screen: {exc}")
 
     @staticmethod
     def find_files(query: str) -> list[Path]:
